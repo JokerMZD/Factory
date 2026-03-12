@@ -210,7 +210,7 @@ extension ManagedContainer {
     }
     /// Defines a decorator for the container. This decorator will see every dependency resolved by this container.
     public func decorator(_ decorator: ((Any) -> ())?) {
-        globalVariableLock.withLock {
+        globalRecursiveLock.withLock {
             manager.decorator = decorator
         }
     }
@@ -233,6 +233,26 @@ extension ManagedContainer {
 }
 
 // MARK: - ContainerManager
+
+// MARK: - InflightResolution
+
+/// Tracks an in-progress factory execution for a scoped key.
+///
+/// When a cache-miss occurs under the split-lock pattern, the first thread to reach that key
+/// creates an `InflightResolution` entry and proceeds to execute the factory. Subsequent threads
+/// that cache-miss on the same key while the first is still executing will wait on the condition
+/// rather than creating a duplicate instance.
+///
+/// Once the factory completes and the result is stored in the scope cache, the owning thread
+/// signals all waiters and removes the inflight entry.
+internal final class InflightResolution {
+    /// Condition variable used to block waiters until the factory execution completes.
+    let condition = NSCondition()
+    /// Number of threads waiting for this resolution to complete.
+    var waiters: Int = 0
+    /// Set to `true` once the factory execution is complete and the result is in the cache.
+    var completed: Bool = false
+}
 
 /// ContainerManager manages the registration and scope caching storage mechanisms for a given container.
 ///
@@ -317,6 +337,9 @@ public final class ContainerManager: @unchecked Sendable {
     internal lazy var options: FactoryOptionsMap = .init(minimumCapacity: 256)
     /// Scope cache for Factory's managed by this container.
     internal lazy var cache: Scope.Cache = Scope.Cache(minimumCapacity: 256)
+    /// Tracks in-progress factory executions for scoped keys to prevent duplicate creations.
+    /// Protected by globalRecursiveLock — entries are added before unlock, removed after relock.
+    internal var inflight: [FactoryKey: InflightResolution] = [:]
     /// Push/Pop stack for registrations, options, cache, and so on.
     internal lazy var stack: [(FactoryMap, FactoryOptionsMap, Scope.Cache.CacheMap, Bool)] = []
 
@@ -337,6 +360,15 @@ extension ContainerManager {
                 self.registrations.removeAll(keepingCapacity: true)
                 self.options.removeAll(keepingCapacity: true)
                 self.cache.reset()
+                // Signal all inflight waiters before clearing so blocked threads can wake up.
+                // They will re-check the (now-empty) cache and proceed to create new instances.
+                for (_, entry) in self.inflight {
+                    entry.condition.lock()
+                    entry.completed = true
+                    entry.condition.broadcast()
+                    entry.condition.unlock()
+                }
+                self.inflight.removeAll()
                 self.autoRegistrationCheckNeeded = true
                 self._defaultScope = nil
                 self._dependencyChainTestMax = 8
@@ -355,6 +387,13 @@ extension ContainerManager {
                 self.autoRegistrationCheckNeeded = true
             case .scope:
                 self.cache.reset()
+                for (_, entry) in self.inflight {
+                    entry.condition.lock()
+                    entry.completed = true
+                    entry.condition.broadcast()
+                    entry.condition.unlock()
+                }
+                self.inflight.removeAll()
             }
         }
     }

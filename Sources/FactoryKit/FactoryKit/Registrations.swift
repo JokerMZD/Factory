@@ -62,10 +62,25 @@ public struct FactoryRegistration<P,T>: Sendable {
 
     /// Resolves a Factory, returning an instance of the desired type. All roads lead here.
     ///
-    /// - Parameter factory: Factory wanting resolution.
+    /// Resolution uses a split-lock pattern to avoid holding the global lock while executing user factory
+    /// closures and decorators:
+    ///   - **Phase 1 (locked):** Read metadata, select factory, check scope cache (fast-path return on hit).
+    ///     If a scoped cache-miss occurs, check for an inflight resolution by another thread. If one exists,
+    ///     wait for it to complete and re-check the cache. Otherwise, claim the key and proceed.
+    ///   - **Phase 2 (unlocked):** Execute the user's factory closure.
+    ///   - **Phase 3 (locked):** Store result in scope cache, signal inflight waiters, update graph depth.
+    ///   - **Phase 4 (unlocked):** Run decorators.
+    ///
+    /// The inflight gate ensures that concurrent cache-miss resolvers for the same scoped key produce
+    /// exactly one instance (the first to complete), preventing duplicate creations under contention.
+    ///
+    /// - Parameter parameters: The parameter to pass to the factory closure (Void for Factory).
     /// - Returns: Instance of the desired type.
     internal func resolve(with parameters: P) -> T {
-        defer { globalRecursiveLock.unlock()  }
+
+        // ──────────────────────────────────────────────
+        // Phase 1: Locked — read metadata + cache check
+        // ──────────────────────────────────────────────
         globalRecursiveLock.lock()
 
         container.unsafeCheckAutoRegistration()
@@ -76,24 +91,25 @@ public struct FactoryRegistration<P,T>: Sendable {
         var current: (P) -> T
 
         #if DEBUG
-        let traceLevel: Int = globalTraceResolutions.count
+        var traceResolutions = threadTraceResolutionsGet()
+        let traceLevel: Int = traceResolutions.count
         var traceNew: String?
         var traceNewType: String?
         #endif
 
         if let found = options?.factoryForCurrentContext() as? TypedFactory<P,T> {
             #if DEBUG
-            traceNewType = "O" // .onTest, .onDebug, etc.
+            traceNewType = "O"
             #endif
             current = found.factory
         } else if let found = manager.registrations[key] as? TypedFactory<P,T> {
             #if DEBUG
-            traceNewType = "R" // .register {}
+            traceNewType = "R"
             #endif
             current = found.factory
         } else {
             #if DEBUG
-            traceNewType = "F" // Factory { ... }
+            traceNewType = "F"
             #endif
             current = factory
         }
@@ -102,56 +118,200 @@ public struct FactoryRegistration<P,T>: Sendable {
         if manager.dependencyChainTestMax > 0 {
             circularDependencyChainCheck(max: manager.dependencyChainTestMax)
         }
+        #endif
+
+        let scope = options?.scope ?? manager.defaultScope
+        let parameterizedKey = (scope != nil && options?.scopeOnParameters == true) ? key.parameterized(parameters) : key
+        let ttl = options?.ttl
+        let cache = manager.cache
+        var ownsInflightEntry = false
+
+        // Fast path: scope cache hit — run decorators but skip factory execution
+        if let scope = scope {
+            if let cached: T = scope.cachedValue(using: cache, key: parameterizedKey, ttl: ttl) {
+                #if DEBUG
+                // Trace: record cache hit
+                if manager.trace {
+                    traceResolutions.append("")
+                    let depth = graphDepthInc()
+                    let indent = String(repeating: "    ", count: depth - 1)
+                    let address = Int(bitPattern: ObjectIdentifier(cached as AnyObject))
+                    traceResolutions[traceLevel] = "\(depth - 1): \(indent)\(container).\(debug.key) = C:\(address) \(type(of: cached as Any))"
+                    graphDepthDec()
+                    if graphDepthGet() == 0 {
+                        traceResolutions.forEach { globalLogger($0) }
+                        traceResolutions = []
+                    }
+                    threadTraceResolutionsSet(traceResolutions)
+                }
+                var depChain = threadDependencyChainGet()
+                if !depChain.isEmpty {
+                    depChain.removeLast()
+                    threadDependencyChainSet(depChain)
+                }
+                #endif
+                // Capture decorator references while still under lock
+                let factoryDecorator = (options?.decorator as? TypedDecoratorBox<T>)?.decorator
+                let containerDecorator = manager.decorator
+                globalRecursiveLock.unlock()
+                // Run decorators even on cache hits (matches original behavior)
+                if let decorator = factoryDecorator {
+                    decorator(cached)
+                }
+                if let decorator = containerDecorator {
+                    decorator(cached)
+                }
+                return cached
+            }
+
+            // Re-entrant guard: if this thread is already resolving this key, it's a circular
+            // dependency that would deadlock on the inflight gate. Fail fast.
+            // Don't remove the key — the original in-progress resolution owns it.
+            if !resolvingKeysInsert(parameterizedKey) {
+                globalRecursiveLock.unlock()
+                let message = "FACTORY: Re-entrant resolution of the same scoped key detected. This is a circular dependency that would cause a deadlock."
+                #if DEBUG
+                resetAndTriggerFatalError(message, #file, #line)
+                #else
+                fatalError(message)
+                #endif
+            }
+
+            // Inflight gate: another thread is already creating an instance for this key.
+            // Wait for it to finish, then re-check the cache.
+            if let inflight = manager.inflight[parameterizedKey] {
+                inflight.waiters += 1
+                globalRecursiveLock.unlock()
+
+                inflight.condition.lock()
+                while !inflight.completed {
+                    inflight.condition.wait()
+                }
+                inflight.condition.unlock()
+
+                // Re-acquire lock to check the now-populated cache
+                globalRecursiveLock.lock()
+                resolvingKeysRemove(parameterizedKey)
+                if let cached: T = scope.cachedValue(using: cache, key: parameterizedKey, ttl: ttl) {
+                    #if DEBUG
+                    var depChainW = threadDependencyChainGet()
+                    if !depChainW.isEmpty {
+                        depChainW.removeLast()
+                        threadDependencyChainSet(depChainW)
+                    }
+                    #endif
+                    // Capture decorator references while still under lock
+                    let factoryDecoratorW = (options?.decorator as? TypedDecoratorBox<T>)?.decorator
+                    let containerDecoratorW = manager.decorator
+                    globalRecursiveLock.unlock()
+                    // Run decorators even on cache hits (matches original behavior)
+                    if let decorator = factoryDecoratorW {
+                        decorator(cached)
+                    }
+                    if let decorator = containerDecoratorW {
+                        decorator(cached)
+                    }
+                    return cached
+                }
+                // Cache was evicted between signal and re-lock — fall through to create a new instance.
+                // Re-insert into resolving set since we're about to create.
+                resolvingKeysInsert(parameterizedKey)
+            }
+
+            // Claim this key: we are the thread that will execute the factory.
+            if manager.inflight[parameterizedKey] == nil {
+                let inflightEntry = InflightResolution()
+                manager.inflight[parameterizedKey] = inflightEntry
+                ownsInflightEntry = true
+            }
+        }
+
+        #if DEBUG
         if manager.trace {
             let wrapped = current
             current = {
-                traceNew = traceNewType // detects if new instance was created from the wrapped factory
+                traceNew = traceNewType
                 return wrapped($0)
             }
-            globalTraceResolutions.append("")
+            traceResolutions.append("")
+            threadTraceResolutionsSet(traceResolutions)
         }
         #endif
 
-        globalGraphResolutionDepth += 1
-        let instance: T
-        if let scope = options?.scope ?? manager.defaultScope {
-            let parameterizedKey = options?.scopeOnParameters == true ? key.parameterized(parameters) : key
-            instance = scope.resolve(using: manager.cache, key: parameterizedKey, ttl: options?.ttl, factory: { current(parameters) }) }
-        else {
-            instance = current(parameters)
-        }
-        globalGraphResolutionDepth -= 1
+        graphDepthInc()
 
-        if globalGraphResolutionDepth == 0 {
-            Scope.graph.cache.reset()
+        // Capture decorator references while still under lock
+        let factoryDecorator = (options?.decorator as? TypedDecoratorBox<T>)?.decorator
+        let containerDecorator = manager.decorator
+
+        globalRecursiveLock.unlock()
+
+        // ──────────────────────────────────────────────
+        // Phase 2: Unlocked — execute factory closure
+        // ──────────────────────────────────────────────
+        let instance: T = current(parameters)
+
+        // ──────────────────────────────────────────────
+        // Phase 3: Locked — store in cache + bookkeeping
+        // ──────────────────────────────────────────────
+        globalRecursiveLock.lock()
+
+        if let scope = scope {
+            scope.store(instance, using: cache, key: parameterizedKey)
+        }
+
+        // Signal inflight waiters and remove entry (only if we own it)
+        if ownsInflightEntry, let inflight = manager.inflight.removeValue(forKey: parameterizedKey) {
+            inflight.condition.lock()
+            inflight.completed = true
+            inflight.condition.broadcast()
+            inflight.condition.unlock()
+        }
+
+        // Remove from thread-local resolving set now that the instance is cached
+        resolvingKeysRemove(parameterizedKey)
+
+        let currentDepth = graphDepthDec()
+
+        if currentDepth == 0 {
+            threadGraphCacheReset()
             #if DEBUG
-            globalDependencyChainMessages = []
+            threadDependencyChainMessagesSet([])
             #endif
         }
-        
+
         #if DEBUG
-        if !globalDependencyChain.isEmpty {
-            globalDependencyChain.removeLast()
+        var depChain = threadDependencyChainGet()
+        if !depChain.isEmpty {
+            depChain.removeLast()
+            threadDependencyChainSet(depChain)
         }
 
         if manager.trace {
-            let indent = String(repeating: "    ", count: globalGraphResolutionDepth)
+            var traceRes = threadTraceResolutionsGet()
+            let indent = String(repeating: "    ", count: currentDepth)
             let address = Int(bitPattern: ObjectIdentifier(instance as AnyObject))
             let resolution = "\(traceNew ?? "C"):\(address) \(type(of: instance as Any))"
-            if globalTraceResolutions.count > traceLevel {
-                globalTraceResolutions[traceLevel] = "\(globalGraphResolutionDepth): \(indent)\(container).\(debug.key) = \(resolution)"
+            if traceRes.count > traceLevel {
+                traceRes[traceLevel] = "\(currentDepth): \(indent)\(container).\(debug.key) = \(resolution)"
             }
-            if globalGraphResolutionDepth == 0 {
-                globalTraceResolutions.forEach { globalLogger($0) }
-                globalTraceResolutions = []
+            if currentDepth == 0 {
+                traceRes.forEach { globalLogger($0) }
+                traceRes = []
             }
+            threadTraceResolutionsSet(traceRes)
         }
         #endif
 
-        if let decorator = options?.decorator as? (T) -> Void {
+        globalRecursiveLock.unlock()
+
+        // ──────────────────────────────────────────────
+        // Phase 4: Unlocked — run decorators
+        // ──────────────────────────────────────────────
+        if let decorator = factoryDecorator {
             decorator(instance)
         }
-        if let decorator = manager.decorator {
+        if let decorator = containerDecorator {
             decorator(instance)
         }
 
@@ -224,7 +384,7 @@ public struct FactoryRegistration<P,T>: Sendable {
     /// Registers a new decorator.
     internal func decorator(_ decorator: @escaping (T) -> Void) {
         options { options in
-            options.decorator = decorator
+            options.decorator = TypedDecoratorBox(decorator: decorator)
         }
     }
 
@@ -275,18 +435,23 @@ public struct FactoryRegistration<P,T>: Sendable {
     internal func circularDependencyChainCheck(max: Int) {
         let typeComponents = debug.type.components(separatedBy: CharacterSet(charactersIn: "<>"))
         let typeName = typeComponents.count > 1 ? typeComponents[1] : typeComponents[0]
-        let typeIndex = globalDependencyChain.firstIndex(where: { $0 == typeName })
-        globalDependencyChain.append(typeName)
+        var depChain = threadDependencyChainGet()
+        let typeIndex = depChain.firstIndex(where: { $0 == typeName })
+        depChain.append(typeName)
         if let index = typeIndex {
-            let chain = globalDependencyChain[index...]
+            let chain = depChain[index...]
             let message = "FACTORY: Circular dependency chain - \(chain.joined(separator: " > "))"
-            if globalDependencyChainMessages.filter({ $0 == message }).count == max {
+            var depMessages = threadDependencyChainMessagesGet()
+            if depMessages.filter({ $0 == message }).count == max {
                 resetAndTriggerFatalError(message, #file, #line)
             } else {
-                globalDependencyChain = [typeName]
-                globalDependencyChainMessages.append(message)
+                threadDependencyChainSet([typeName])
+                depMessages.append(message)
+                threadDependencyChainMessagesSet(depMessages)
+                return
             }
         }
+        threadDependencyChainSet(depChain)
     }
     #endif
 
@@ -308,6 +473,16 @@ public enum FactoryResetOptions {
     case scope
 }
 
+/// Type-safe wrapper for factory decorators.
+///
+/// Wrapping the decorator in a generic struct makes the `as?` downcast match on the struct's
+/// generic parameter rather than on bare function-type metadata. This is more robust against
+/// future Swift runtime changes to function type casting (e.g., stricter `@Sendable` / `@MainActor`
+/// attribute matching) and eliminates silent cast failures.
+internal struct TypedDecoratorBox<T> {
+    let decorator: (T) -> Void
+}
+
 internal struct FactoryOptions {
     /// Managed scope for this factory instance
     var scope: Scope?
@@ -320,6 +495,7 @@ internal struct FactoryOptions {
     /// Contexts
     var contexts: [String:AnyFactory]?
     /// Decorator will be passed fully constructed instance for further configuration.
+    /// Stored as `TypedDecoratorBox<T>` erased to `Any?` for type-safe retrieval.
     var decorator: Any?
     /// Once flag for options
     var once: Bool = false

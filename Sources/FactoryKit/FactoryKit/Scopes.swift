@@ -75,6 +75,31 @@ public class Scope: @unchecked Sendable {
         return instance
     }
 
+    /// Returns a cached value for the given key if one exists and is still valid, or nil on a cache miss.
+    /// Called under the global lock during the locked-read phase of split-lock resolution.
+    internal func cachedValue<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?) -> T? {
+        if let box = cache.value(forKey: key), let cached: T = unboxed(box: box) {
+            if let ttl = ttl {
+                let now = CFAbsoluteTimeGetCurrent()
+                if (box.timestamp + ttl) > now {
+                    cache.set(timestamp: now, forKey: key)
+                    return cached
+                }
+                return nil
+            }
+            return cached
+        }
+        return nil
+    }
+
+    /// Stores a newly created instance into the scope cache.
+    /// Called under the global lock during the relock-to-store phase of split-lock resolution.
+    internal func store<T>(_ instance: T, using cache: Cache, key: FactoryKey) {
+        if let box = box(instance) {
+            cache.set(value: box, forKey: key)
+        }
+    }
+
     /// Internal function returns unboxed value if it exists
     fileprivate func unboxed<T>(box: AnyBox?) -> T? {
         (box as? StrongBox<T>)?.boxed
@@ -89,6 +114,24 @@ public class Scope: @unchecked Sendable {
             return nil
         }
         return StrongBox<T>(scopeID: scopeID, timestamp: CFAbsoluteTimeGetCurrent(), boxed: instance)
+    }
+
+    /// MainActor-isolated overload that accepts a `@MainActor` factory closure.
+    ///
+    /// This is the single point of `@MainActor` erasure for the entire framework.
+    /// The erasure is safe because:
+    ///   1. This method is `@MainActor`, so it can only be called from MainActor.
+    ///   2. `resolve(using:key:ttl:factory:)` calls `factory()` synchronously.
+    ///   3. Therefore the closure executes on MainActor as required.
+    ///
+    /// Subclasses that override `resolve` must also override this method to redirect
+    /// through their own cache (see `Graph`, `Singleton`) or behavior (see `Unique`).
+    @MainActor
+    internal func resolve<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?, factory: @MainActor () -> T) -> T {
+        withoutActuallyEscaping(factory) { escapable in
+            let erased = unsafeBitCast(escapable, to: (() -> T).self)
+            return resolve(using: cache, key: key, ttl: ttl, factory: erased)
+        }
     }
 
     internal let scopeID: UUID = UUID()
@@ -113,16 +156,26 @@ extension Scope {
     /// Defines the graph scope. A single instance of a given type will be returned during a given resolution cycle.
     ///
     /// This scope is managed and cleared by the main resolution function at the end of each resolution cycle.
+    /// The cache is thread-local so that concurrent resolution cycles on different threads don't share
+    /// or corrupt each other's graph-scoped instances.
     public final class Graph: Scope, @unchecked Sendable  {
         public override init() {
             super.init()
         }
         internal override func resolve<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?, factory: () -> T) -> T {
-            // ignore container's cache in favor of our own
-            return super.resolve(using: self.cache, key: key, ttl: ttl, factory: factory)
+            // ignore container's cache in favor of the thread-local graph cache
+            return super.resolve(using: threadGraphCacheGet(), key: key, ttl: ttl, factory: factory)
         }
-        /// Private shared cache
-        internal var cache = Cache()
+        @MainActor
+        internal override func resolve<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?, factory: @MainActor () -> T) -> T {
+            return super.resolve(using: threadGraphCacheGet(), key: key, ttl: ttl, factory: factory)
+        }
+        internal override func cachedValue<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?) -> T? {
+            super.cachedValue(using: threadGraphCacheGet(), key: key, ttl: ttl)
+        }
+        internal override func store<T>(_ instance: T, using cache: Cache, key: FactoryKey) {
+            super.store(instance, using: threadGraphCacheGet(), key: key)
+        }
     }
 
     /// A reference to the default shared scope manager.
@@ -177,6 +230,16 @@ extension Scope {
             // ignore container's cache in favor of our own
             return super.resolve(using: self.cache, key: key, ttl: ttl, factory: factory)
         }
+        @MainActor
+        internal override func resolve<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?, factory: @MainActor () -> T) -> T {
+            return super.resolve(using: self.cache, key: key, ttl: ttl, factory: factory)
+        }
+        internal override func cachedValue<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?) -> T? {
+            super.cachedValue(using: self.cache, key: key, ttl: ttl)
+        }
+        internal override func store<T>(_ instance: T, using cache: Cache, key: FactoryKey) {
+            super.store(instance, using: self.cache, key: key)
+        }
         /// Private shared cache
         internal var cache: Cache
         /// Reset
@@ -204,6 +267,19 @@ extension Scope {
         internal override func resolve<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?, factory: () -> T) -> T {
             factory()
         }
+        @MainActor
+        internal override func resolve<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?, factory: @MainActor () -> T) -> T {
+            factory()
+        }
+        // Unique scope never caches — always returns nil so the split-lock path
+        // always executes the factory and creates a new instance.
+        internal override func cachedValue<T>(using cache: Cache, key: FactoryKey, ttl: TimeInterval?) -> T? {
+            nil
+        }
+        // No-op: unique scope should never store instances in any cache.
+        internal override func store<T>(_ instance: T, using cache: Cache, key: FactoryKey) {
+            // intentionally empty
+        }
     }
 
 }
@@ -225,7 +301,8 @@ extension Scope {
             cache[key]?.timestamp = timestamp
         }
         @inlinable @inline(__always) func removeValue(forKey key: FactoryKey) {
-            cache = cache.filter { $0.key.normalized() != key }
+            let normalized = key.normalized()
+            cache = cache.filter { $0.key.normalized() != normalized }
         }
         internal func reset(scopeID: UUID) {
             cache = cache.filter { $1.scopeID != scopeID }

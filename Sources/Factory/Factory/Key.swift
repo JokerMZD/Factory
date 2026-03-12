@@ -25,16 +25,31 @@
 //
 import Foundation
 
+/// Isolation domain discriminator for FactoryKey.
+///
+/// Prevents MainActorFactory and Factory from sharing the same cache entry when they happen
+/// to have the same type + key combination. Without this, a non-MainActor Factory could retrieve
+/// a cached instance that was created under @MainActor isolation, violating Swift 6 concurrency safety.
+internal enum FactoryKeyIsolation: UInt8, Hashable {
+    /// Standard (nonisolated) factory.
+    case nonisolated = 0
+    /// @MainActor-isolated factory.
+    case mainActor = 1
+}
+
 internal struct FactoryKey: Hashable {
 
     let type: ObjectIdentifier
     let key: StaticString
+    /// Isolation domain this key belongs to. Prevents cross-isolation cache leaks.
+    let isolation: FactoryKeyIsolation
 
     var parameter: Int
 
-    internal init(type: Any.Type, key: StaticString) {
+    internal init(type: Any.Type, key: StaticString, isolation: FactoryKeyIsolation = .nonisolated) {
         self.type = globalIdentifier(for: type)
         self.key = key
+        self.isolation = isolation
         self.parameter = 0
     }
 
@@ -54,12 +69,14 @@ internal struct FactoryKey: Hashable {
             hasher.combine(key.unicodeScalar.value)
         }
         hasher.combine(self.parameter)
+        hasher.combine(self.isolation)
     }
 
     internal static func == (lhs: Self, rhs: Self) -> Bool {
         guard lhs.type == rhs.type
                 && lhs.key.hasPointerRepresentation == rhs.key.hasPointerRepresentation
                 && lhs.parameter == rhs.parameter
+                && lhs.isolation == rhs.isolation
         else {
             return false
         }
@@ -70,6 +87,8 @@ internal struct FactoryKey: Hashable {
         }
     }
 
+    /// Returns a copy of this key with `parameter` set from the given value's hash.
+    /// Uses `var copy = self` to preserve all fields (including `isolation`).
     internal func parameterized(_ value: Any) -> Self {
         guard let hashable = value as? any Hashable else {
             return self
@@ -79,6 +98,8 @@ internal struct FactoryKey: Hashable {
         return copy
     }
 
+    /// Returns a copy of this key with `parameter` reset to 0.
+    /// Uses `var copy = self` to preserve all fields (including `isolation`).
     internal func normalized() -> Self {
         var copy = self
         copy.parameter = 0
